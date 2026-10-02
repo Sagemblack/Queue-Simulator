@@ -8,6 +8,42 @@ MPlusApplicationTrackerCharacterDB = nil
 
 local tracker = Core.new(QueueSimulatorCharacterDB, QueueSimulatorAccountDB, QueueSimulatorCharacterDB.sessionState, QueueSimulatorAccountDB.sessionState)
 local active = tracker.session.active
+local pendingApplicationDetails = {}
+local lastInspection
+local recentKeyTitles = {}
+local recentKeyTitleAvailable = {}
+
+local ROLE_ORDER = { "TANK", "HEALER", "DAMAGER" }
+local ROLE_ATLASES = {
+  TANK = "groupfinder-icon-role-micro-tank",
+  HEALER = "groupfinder-icon-role-micro-heal",
+  DAMAGER = "groupfinder-icon-role-micro-dps",
+}
+local function roleName(role)
+  return role and (_G[role] or role) or "Unknown"
+end
+
+local function roleIcon(role)
+  local atlas = ROLE_ATLASES[role]
+  if not atlas or not CreateAtlasMarkup then return "" end
+  return CreateAtlasMarkup(atlas, 14, 14, 0, 0) .. " "
+end
+
+local function formatRoles(roles)
+  local labels = {}
+  for _, role in ipairs(ROLE_ORDER) do
+    if roles and roles[role] then table.insert(labels, roleName(role)) end
+  end
+  return #labels > 0 and table.concat(labels, " + ") or "Unknown"
+end
+
+local function formatRolesWithIcons(roles)
+  local labels = {}
+  for _, role in ipairs(ROLE_ORDER) do
+    if roles and roles[role] then table.insert(labels, roleIcon(role) .. roleName(role)) end
+  end
+  return #labels > 0 and table.concat(labels, " + ") or "Unknown"
+end
 
 local function fmtTime(seconds)
   seconds = math.max(0, math.floor(seconds or 0))
@@ -109,6 +145,73 @@ dashboardFrame:SetScript("OnDragStop", dashboardFrame.StopMovingOrSizing)
 makeBackdrop(dashboardFrame, 0.98)
 dashboardFrame:Hide()
 
+local acceptedFrame = CreateFrame("Frame", "QueueSimulatorAcceptedFrame", UIParent, "BackdropTemplate,SecureHandlerStateTemplate")
+acceptedFrame:SetSize(430, 436)
+acceptedFrame:SetPoint("CENTER")
+acceptedFrame:SetMovable(true)
+acceptedFrame:EnableMouse(true)
+acceptedFrame:RegisterForDrag("LeftButton")
+acceptedFrame:SetScript("OnDragStart", function(self)
+  if not InCombatLockdown() then self:StartMoving() end
+end)
+acceptedFrame:SetScript("OnDragStop", function(self)
+  if not InCombatLockdown() then self:StopMovingOrSizing() end
+end)
+makeBackdrop(acceptedFrame, 0.98)
+acceptedFrame:SetBackdropBorderColor(0.35, 0.9, 0.45, 0.9)
+acceptedFrame:Hide()
+-- Escape is handled by an unprotected proxy in Teleport.lua, never this protected parent.
+
+local acceptedTitle = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+acceptedTitle:SetPoint("TOP", 0, -18)
+acceptedTitle:SetText("ACCEPTED!")
+setTone(acceptedTitle, "accepted")
+local acceptedDungeon = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+acceptedDungeon:SetPoint("TOP", 0, -50)
+acceptedDungeon:SetWidth(390)
+local acceptedDestination = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+acceptedDestination:SetPoint("TOP", 0, -76)
+acceptedDestination:SetWidth(390)
+setTone(acceptedDestination, "primary")
+local acceptedAppliedRoles = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+acceptedAppliedRoles:SetPoint("TOP", 0, -101)
+acceptedAppliedRoles:SetTextColor(0.68, 0.72, 0.8)
+local acceptedRole = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+acceptedRole:SetPoint("TOP", 0, -119)
+acceptedRole:SetTextColor(0.68, 0.72, 0.8)
+local acceptedDurationLabel = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+acceptedDurationLabel:SetPoint("TOPLEFT", 22, -149)
+acceptedDurationLabel:SetText("Session time")
+local acceptedDurationValue = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+acceptedDurationValue:SetPoint("TOPRIGHT", -22, -149)
+setTone(acceptedDurationValue, "primary")
+local acceptedDivider = acceptedFrame:CreateTexture(nil, "ARTWORK")
+acceptedDivider:SetColorTexture(0.3, 0.7, 0.4, 0.45)
+acceptedDivider:SetPoint("TOPLEFT", 18, -173)
+acceptedDivider:SetPoint("TOPRIGHT", -18, -173)
+acceptedDivider:SetHeight(1)
+
+local acceptedStatRows = {}
+for index = 1, 8 do
+  local column = (index - 1) % 2
+  local row = math.floor((index - 1) / 2)
+  local x = 22 + column * 196
+  local y = -194 - row * 29
+  local label = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  label:SetPoint("TOPLEFT", x, y)
+  local value = acceptedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  value:SetPoint("TOPRIGHT", acceptedFrame, "TOPLEFT", x + 172, y + 1)
+  acceptedStatRows[index] = { label = label, value = value }
+end
+
+local acceptedTeleport = QueueSimulatorTeleport.attach(acceptedFrame)
+
+local closeAcceptedButton = makeButton(acceptedFrame, "Close", 120)
+closeAcceptedButton:SetPoint("BOTTOMLEFT", 34, 18)
+closeAcceptedButton:SetScript("OnClick", function() acceptedTeleport:Close() end)
+local acceptedDashboardButton = makeButton(acceptedFrame, "Open Dashboard", 150)
+acceptedDashboardButton:SetPoint("BOTTOMRIGHT", -34, 18)
+
 local dashboardTitle = dashboardFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 dashboardTitle:SetPoint("TOPLEFT", 18, -14)
 dashboardTitle:SetText("QUEUE SIMULATOR DASHBOARD")
@@ -197,14 +300,20 @@ local function acquireSessionRow(poolIndex)
   rowFrame.toggle:SetHeight(28)
   rowFrame.heading = rowFrame.toggle:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   rowFrame.heading:SetPoint("LEFT", 7, 0)
+  rowFrame.keyTitle = rowFrame.toggle:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  rowFrame.keyTitle:SetPoint("LEFT", rowFrame.heading, "RIGHT", 6, 0)
+  setTone(rowFrame.keyTitle, "primary")
   rowFrame.summary = rowFrame.toggle:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   rowFrame.summary:SetPoint("RIGHT", -7, 0)
+  rowFrame.roles = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  rowFrame.roles:SetPoint("TOPLEFT", 14, -42)
+  rowFrame.roles:SetTextColor(0.68, 0.72, 0.8)
   rowFrame.details = {}
   for detailIndex = 0, 9 do
     local column = detailIndex % 4
     local detailRow = math.floor(detailIndex / 4)
     local x = 14 + column * 152
-    local detailY = -47 - detailRow * 26
+    local detailY = -67 - detailRow * 26
     local label = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     label:SetPoint("TOPLEFT", x, detailY)
     local value = rowFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -217,14 +326,19 @@ end
 
 local function createSessionRow(row, y, poolIndex)
   local expanded = expandedSessions[row.index] == true
-  local height = expanded and 138 or 38
+  local height = expanded and 158 or 38
   local rowFrame = acquireSessionRow(poolIndex)
   rowFrame:ClearAllPoints()
   rowFrame:SetPoint("TOPLEFT", 0, -y)
   rowFrame:SetSize(630, height)
   rowFrame:Show()
-  rowFrame.heading:SetText(string.format("%s  Session #%d", expanded and "–" or "+", row.index))
+  local rowTitle = roleIcon(row.acceptedRole) .. (row.destination or string.format("Session #%d", row.index))
+  rowFrame.heading:SetText(string.format("%s  %s", expanded and "–" or "+", rowTitle))
+  rowFrame.keyTitle:SetText(recentKeyTitles[row.index])
+  rowFrame.keyTitle:SetShown(row.acceptedKeyLevel == nil and recentKeyTitleAvailable[row.index] == true)
   rowFrame.summary:SetText(string.format("%d applications   %s   %d accepted", row.applications, fmtTime(row.duration), row.accepted))
+  rowFrame.roles:SetText(string.format("Applied as: %s    Accepted as: %s", formatRoles(row.appliedRoles), roleName(row.acceptedRole)))
+  rowFrame.roles:SetShown(expanded and row.reason == "accepted")
   rowFrame.toggle:SetScript("OnClick", function()
     expandedSessions[row.index] = not expanded
     refreshDashboard()
@@ -273,6 +387,31 @@ local function showDashboard()
   dashboardFrame:Raise()
 end
 
+local ACCEPTED_STAT_INDICES = { 1, 3, 4, 5, 6, 7, 8, 9 }
+local function showAcceptedPopup(groupName, instanceMapID)
+  local session = tracker.session
+  local duration = tracker:elapsed(GetTime())
+  local stats = Core.sessionStats(session)
+  acceptedTeleport:Show(instanceMapID, function()
+  acceptedDungeon:SetText(session.acceptedDungeon or "Mythic+ dungeon")
+  acceptedDestination:SetText(groupName)
+  acceptedAppliedRoles:SetText(string.format("Applied as: %s", formatRolesWithIcons(session.appliedRoles)))
+  acceptedRole:SetText(string.format("Accepted as: %s%s", roleIcon(session.acceptedRole), roleName(session.acceptedRole)))
+  acceptedDurationValue:SetText(fmtTime(duration))
+  for rowIndex, statIndex in ipairs(ACCEPTED_STAT_INDICES) do
+    local stat = stats[statIndex]
+    local row = acceptedStatRows[rowIndex]
+    row.label:SetText(stat.label)
+    row.value:SetText(stat.value)
+    setTone(row.value, stat.tone)
+  end
+  end)
+end
+
+acceptedDashboardButton:SetScript("OnClick", function()
+  showDashboard()
+end)
+
 local function refresh()
   local stats = Core.sessionStats(tracker.session)
   applicationValue:SetText(stats[1].value)
@@ -297,6 +436,8 @@ StaticPopupDialogs.QUEUESIMULATOR_CLEAR_HISTORY = {
   button2 = "Cancel",
   OnAccept = function()
     tracker:clearHistory()
+    recentKeyTitles = {}
+    recentKeyTitleAvailable = {}
     refreshDashboard()
     print("Queue Simulator: session history cleared. Lifetime totals were kept.")
   end,
@@ -316,6 +457,10 @@ StaticPopupDialogs.QUEUESIMULATOR_RESET_LIFETIME = {
   button2 = "Cancel",
   OnAccept = function()
     tracker:resetLifetime()
+    pendingApplicationDetails = {}
+    acceptedTeleport:Close()
+    recentKeyTitles = {}
+    recentKeyTitleAvailable = {}
     active = tracker.session.active
     frame:Hide()
     refresh()
@@ -341,25 +486,83 @@ endButton:SetScript("OnClick", function()
 end)
 dashboardButton:SetScript("OnClick", showDashboard)
 
-local function isMythicPlus(searchResultID)
-  if not C_LFGList or not C_LFGList.GetSearchResultInfo then return false end
-  local info = C_LFGList.GetSearchResultInfo(searchResultID)
-  if not info then return false end
-  local activityID = info.activityID
-  if not activityID and info.activityIDs then activityID = info.activityIDs[1] end
-  if not activityID or not C_LFGList.GetActivityInfoTable then return false end
-  local activity = C_LFGList.GetActivityInfoTable(activityID)
-  return activity and activity.isMythicPlusActivity == true
-end
-
 local TERMINAL = {
   declined = true, cancelled = true, declined_full = true,
   declined_delisted = true, timedout = true, failed = true,
   inviteaccepted = true, invitedeclined = true,
 }
 
-local function markApplication(searchResultID)
-  if tracker:applicationApplied(GetTime(), searchResultID) then
+local function selectedRoles(tank, healer, damage)
+  return {
+    TANK = tank == true,
+    HEALER = healer == true,
+    DAMAGER = damage == true,
+  }
+end
+
+local function getApplicationRole(searchResultID)
+  if not C_LFGList or not C_LFGList.GetApplicationInfo then return nil end
+  local applicationInfo, _, _, _, role = C_LFGList.GetApplicationInfo(searchResultID)
+  if type(applicationInfo) == "table" then role = applicationInfo.role end
+  if role == "NONE" then return nil end
+  return role
+end
+
+local function inspectApplication(searchResultID, appliedRoles)
+  local details = {
+    appliedRoles = appliedRoles,
+    role = getApplicationRole(searchResultID),
+  }
+  if not C_LFGList or not C_LFGList.GetSearchResultInfo then return false, details end
+  local info = C_LFGList.GetSearchResultInfo(searchResultID)
+  if not info then return false, details end
+  local activityID = info.activityID
+  if not activityID and info.activityIDs then activityID = info.activityIDs[1] end
+  if not activityID or not C_LFGList.GetActivityInfoTable then return false, details end
+  local activity = C_LFGList.GetActivityInfoTable(activityID)
+  if not activity then return false, details end
+  local activityGroupID = activity.groupFinderActivityGroupID
+  local activityGroupName
+  if activityGroupID and C_LFGList.GetActivityGroupInfo then
+    activityGroupName = C_LFGList.GetActivityGroupInfo(activityGroupID)
+  end
+  lastInspection = {
+    activityID = activityID,
+    shortName = activity.shortName,
+    fullName = activity.fullName,
+    activityGroupID = activityGroupID,
+    activityGroupName = activityGroupName,
+    mapID = activity.mapID,
+  }
+  local unambiguous = not info.activityIDs or #info.activityIDs == 1
+  if unambiguous and not (issecretvalue and issecretvalue(activity.mapID)) and type(activity.mapID) == "number" then
+    details.instanceMapID = activity.mapID
+  end
+  details.dungeon = activity.fullName or activity.shortName or activityGroupName
+  local parsed, keyLevel = pcall(Core.parseKeyLevel, info.name)
+  if parsed then details.keyLevel = keyLevel end
+  return activity.isMythicPlusActivity == true, details
+end
+
+if hooksecurefunc and C_LFGList and C_LFGList.ApplyToGroup then
+  hooksecurefunc(C_LFGList, "ApplyToGroup", function(searchResultID, tank, healer, damage)
+    local isMythicPlus, details = inspectApplication(searchResultID, selectedRoles(tank, healer, damage))
+    if not isMythicPlus then
+      pendingApplicationDetails[searchResultID] = nil
+      return
+    end
+    pendingApplicationDetails[searchResultID] = details
+    if C_Timer and C_Timer.After then
+      C_Timer.After(60, function()
+        if pendingApplicationDetails[searchResultID] == details then pendingApplicationDetails[searchResultID] = nil end
+      end)
+    end
+  end)
+end
+
+local function markApplication(searchResultID, details)
+  pendingApplicationDetails[searchResultID] = nil
+  if tracker:applicationApplied(GetTime(), searchResultID, details) then
     active = tracker.session.active
     active[searchResultID] = true
     frame:Show()
@@ -375,12 +578,15 @@ local function syncPendingApplications()
   local changed = false
   if type(raw[1]) == "table" then applications = raw[1] end
   for _, searchResultID in ipairs(applications) do
-    if isMythicPlus(searchResultID) and not active[searchResultID] then
-      local info = C_LFGList.GetApplicationInfo and C_LFGList.GetApplicationInfo(searchResultID)
-      local status = info
-      if type(info) == "table" then status = info.applicationStatus or info.pendingApplicationStatus end
-      if status == "applied" or status == "pending" then
-        changed = markApplication(searchResultID) or changed
+    if not active[searchResultID] then
+      local isMythicPlus, details = inspectApplication(searchResultID)
+      if isMythicPlus then
+        local info = C_LFGList.GetApplicationInfo and C_LFGList.GetApplicationInfo(searchResultID)
+        local status = info
+        if type(info) == "table" then status = info.applicationStatus or info.pendingApplicationStatus end
+        if status == "applied" or status == "pending" then
+          changed = markApplication(searchResultID, details) or changed
+        end
       end
     end
   end
@@ -388,18 +594,49 @@ local function syncPendingApplications()
   if changed and dashboardFrame:IsShown() then refreshDashboard() end
 end
 
-local function onApplicationStatus(_, searchResultID, newStatus)
+local function onApplicationStatus(_, searchResultID, newStatus, _, groupName)
   local changed = false
   if newStatus == "applied" then
-    if isMythicPlus(searchResultID) then changed = markApplication(searchResultID) end
+    local details = pendingApplicationDetails[searchResultID]
+    if details then
+      changed = markApplication(searchResultID, details)
+    else
+      local isMythicPlus, inspectedDetails = inspectApplication(searchResultID)
+      if isMythicPlus then changed = markApplication(searchResultID, inspectedDetails) end
+    end
+    pendingApplicationDetails[searchResultID] = nil
   elseif newStatus == "invited" and active[searchResultID] then
+    pendingApplicationDetails[searchResultID] = nil
+    local details = tracker.session.applicationDetails and tracker.session.applicationDetails[searchResultID]
+    if details then details.role = getApplicationRole(searchResultID) or details.role end
     changed = tracker:applicationOutcome(searchResultID, newStatus, GetTime())
   elseif TERMINAL[newStatus] and active[searchResultID] then
+    pendingApplicationDetails[searchResultID] = nil
+    if newStatus == "inviteaccepted" then
+      local details = tracker.session.applicationDetails and tracker.session.applicationDetails[searchResultID]
+      if details then
+        details.role = getApplicationRole(searchResultID) or details.role
+        if not details.keyLevel then
+          local parsed, keyLevel = pcall(Core.parseKeyLevel, groupName)
+          if parsed then details.keyLevel = keyLevel end
+        end
+      end
+    end
+    local acceptedDetails = tracker.session.applicationDetails and tracker.session.applicationDetails[searchResultID]
+    local instanceMapID = acceptedDetails and acceptedDetails.instanceMapID
     if tracker:applicationOutcome(searchResultID, newStatus, GetTime()) then
       changed = true
       active[searchResultID] = nil
       if tracker.session.ended then frame:Hide() end
+      if newStatus == "inviteaccepted" then
+        local historyIndex = #(QueueSimulatorAccountDB.sessionHistory or {})
+        recentKeyTitles[historyIndex] = groupName
+        recentKeyTitleAvailable[historyIndex] = true
+        showAcceptedPopup(groupName, instanceMapID)
+      end
     end
+  elseif TERMINAL[newStatus] or newStatus == "invited" then
+    pendingApplicationDetails[searchResultID] = nil
   end
   refresh()
   if changed and dashboardFrame:IsShown() then refreshDashboard() end
@@ -427,6 +664,9 @@ SlashCmdList.QUEUESIMULATOR = function(message)
   message = string.lower(message or "")
   if message == "reset" then
     tracker:resetSession()
+    active = tracker.session.active
+    pendingApplicationDetails = {}
+    acceptedTeleport:Close()
     refresh()
     print("Queue Simulator: session reset.")
   elseif message == "end" then
@@ -455,6 +695,13 @@ SlashCmdList.QUEUESIMULATOR = function(message)
   elseif message == "debug" then
     local activeCount = Core.activeCount(tracker.session.active)
     print(string.format("Queue Simulator debug: session=%d startedAt=%s ended=%s active=%d charSaved=%s accountSaved=%s visible=%s", tracker.session.applications, tostring(tracker.session.startedAt), tostring(tracker.session.ended), activeCount, tostring(QueueSimulatorCharacterDB.mpatSessionStartedAt), tostring(QueueSimulatorAccountDB.mpatSessionStartedAt), tostring(frame:IsShown())))
+    if lastInspection then
+      print(string.format(
+        "Queue Simulator activity: id=%s short=%s full=%s groupID=%s group=%s mapID=%s",
+        tostring(lastInspection.activityID), tostring(lastInspection.shortName), tostring(lastInspection.fullName),
+        tostring(lastInspection.activityGroupID), tostring(lastInspection.activityGroupName),
+        tostring(lastInspection.mapID)))
+    end
   else
     print("Queue Simulator: /qsim, /qsim status, /qsim show, /qsim hide, /qsim end, /qsim reset, /qsim history, /qsim stats, /qsim debug")
   end

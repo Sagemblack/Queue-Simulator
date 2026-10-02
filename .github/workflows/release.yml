@@ -21,8 +21,12 @@ jobs:
       - name: Test and package
         run: |
           lua tests/run.lua
+          lua tests/addon_mock.lua
+          lua tests/teleport.lua
+          lua tests/teleport_mock.lua
           luac -p QueueSimulator/Core.lua
           luac -p QueueSimulator/Addon.lua
+          luac -p QueueSimulator/Teleport.lua
           bash scripts/package.sh
 
       - name: Create release and upload addon ZIP

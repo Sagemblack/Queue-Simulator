@@ -34,16 +34,45 @@ local function copyActive(source)
   return active
 end
 
+local function copyRoles(source)
+  local roles = {}
+  if type(source) ~= "table" then return roles end
+  for _, role in ipairs({ "TANK", "HEALER", "DAMAGER" }) do
+    if source[role] == true then roles[role] = true end
+  end
+  return roles
+end
+
+local function copyApplicationDetail(detail)
+  if type(detail) ~= "table" then return nil end
+  return {
+    dungeon = detail.dungeon,
+    instanceMapID = detail.instanceMapID,
+    keyLevel = detail.keyLevel,
+    appliedRoles = copyRoles(detail.appliedRoles),
+    role = detail.role,
+  }
+end
+
+local function copyApplicationDetails(source)
+  local details = {}
+  for applicationID, detail in pairs(source or {}) do
+    details[applicationID] = copyApplicationDetail(detail)
+  end
+  return details
+end
+
 local function restoreSession(store)
   local startedAt = store and (store.mpatSessionStartedAt or store.startedAt)
   if not startedAt then
-    return { applications = 0, active = {}, ended = false }
+    return { applications = 0, active = {}, applicationDetails = {}, ended = false }
   end
   local ended = store.mpatSessionEnded
   if ended == nil then ended = store.ended == true end
   return {
     applications = store.mpatSessionApplications or store.applications or 0,
     active = copyActive(store.mpatSessionActive or store.active),
+    applicationDetails = copyApplicationDetails(store.mpatSessionApplicationDetails or store.applicationDetails),
     startedAt = startedAt,
     endedAt = store.mpatSessionEndedAt or store.endedAt,
     ended = ended,
@@ -58,6 +87,10 @@ local function restoreSession(store)
     inviteaccepted = store.mpatSessionInviteAccepted or store.inviteaccepted or 0,
     accepted = store.mpatSessionAccepted or store.accepted or 0,
     invitedeclined = store.mpatSessionInviteDeclined or store.invitedeclined or 0,
+    acceptedDungeon = store.mpatSessionAcceptedDungeon or store.acceptedDungeon,
+    acceptedKeyLevel = store.mpatSessionAcceptedKeyLevel or store.acceptedKeyLevel,
+    appliedRoles = copyRoles(store.mpatSessionAppliedRoles or store.appliedRoles),
+    acceptedRole = store.mpatSessionAcceptedRole or store.acceptedRole,
   }
 end
 
@@ -65,23 +98,33 @@ local function saveSession(store, session)
   if not store then return end
   store.mpatSessionApplications = session.applications
   store.mpatSessionActive = copyActive(session.active)
+  store.mpatSessionApplicationDetails = copyApplicationDetails(session.applicationDetails)
   store.mpatSessionStartedAt = session.startedAt
   store.mpatSessionEndedAt = session.endedAt
   store.mpatSessionEnded = session.ended
   store.mpatSessionRecorded = session.recorded == true
   store.mpatSessionAccepted = session.accepted or 0
+  store.mpatSessionAcceptedDungeon = session.acceptedDungeon
+  store.mpatSessionAcceptedKeyLevel = session.acceptedKeyLevel
+  store.mpatSessionAppliedRoles = copyRoles(session.appliedRoles)
+  store.mpatSessionAcceptedRole = session.acceptedRole
   for _, outcome in ipairs(OUTCOMES) do
     store["mpatSession" .. outcome] = session[outcome] or 0
   end
   -- Keep the nested form for compatibility with the previous 0.1.x builds.
   store.applications = session.applications
   store.active = copyActive(session.active)
+  store.applicationDetails = copyApplicationDetails(session.applicationDetails)
   store.startedAt = session.startedAt
   store.endedAt = session.endedAt
   store.ended = session.ended
   store.recorded = session.recorded == true
   for _, outcome in ipairs(OUTCOMES) do store[outcome] = session[outcome] or 0 end
   store.accepted = session.accepted or 0
+  store.acceptedDungeon = session.acceptedDungeon
+  store.acceptedKeyLevel = session.acceptedKeyLevel
+  store.appliedRoles = copyRoles(session.appliedRoles)
+  store.acceptedRole = session.acceptedRole
 end
 
 local function recordSession(self, reason)
@@ -95,6 +138,10 @@ local function recordSession(self, reason)
   }
   for _, outcome in ipairs(OUTCOMES) do summary[outcome] = self.session[outcome] or 0 end
   summary.accepted = self.session.accepted or 0
+  summary.acceptedDungeon = self.session.acceptedDungeon
+  summary.acceptedKeyLevel = self.session.acceptedKeyLevel
+  summary.appliedRoles = copyRoles(self.session.appliedRoles)
+  summary.acceptedRole = self.session.acceptedRole
   self.session.recorded = true
   self.character.sessionHistory = self.character.sessionHistory or {}
   self.account.sessionHistory = self.account.sessionHistory or {}
@@ -128,11 +175,13 @@ function M.new(characterTotals, accountTotals, sessionStore, fallbackSessionStor
   return setmetatable(self, { __index = M })
 end
 
-function M:applicationApplied(now, applicationID)
+function M:applicationApplied(now, applicationID, details)
   if self.session.ended then self:resetSession() end
   if not self.session.startedAt then self.session.startedAt = now end
   if self.session.active[applicationID] then return false end
   self.session.active[applicationID] = true
+  self.session.applicationDetails = self.session.applicationDetails or {}
+  self.session.applicationDetails[applicationID] = copyApplicationDetail(details)
   self.session.applications = self.session.applications + 1
   self.character.totalApplications = self.character.totalApplications + 1
   self.account.totalApplications = self.account.totalApplications + 1
@@ -146,7 +195,10 @@ function M:endSession(now, reason)
   self.session.ended = true
   self.session.endedAt = now or self.session.startedAt
   recordSession(self, reason or "manual")
-  for applicationID in pairs(self.session.active) do self.session.active[applicationID] = nil end
+  for applicationID in pairs(self.session.active) do
+    self.session.active[applicationID] = nil
+    self.session.applicationDetails[applicationID] = nil
+  end
   saveSession(self.sessionStore, self.session)
   if self.mirrorSessionStore ~= self.sessionStore then saveSession(self.mirrorSessionStore, self.session) end
   return true
@@ -154,13 +206,22 @@ end
 
 function M:applicationOutcome(applicationID, outcome, now)
   if not self.session.active[applicationID] then return false end
+  local details = self.session.applicationDetails and self.session.applicationDetails[applicationID]
   if outcome ~= "invited" then self.session.active[applicationID] = nil end
   self.session[outcome] = (self.session[outcome] or 0) + 1
   self.character[outcome] = self.character[outcome] + 1
   self.account[outcome] = self.account[outcome] + 1
   if outcome == "inviteaccepted" then
     self.session.accepted = (self.session.accepted or 0) + 1
+    if details then
+      self.session.acceptedDungeon = details.dungeon
+      self.session.acceptedKeyLevel = details.keyLevel
+      self.session.appliedRoles = copyRoles(details.appliedRoles)
+      self.session.acceptedRole = details.role
+    end
     self:endSession(now, "accepted")
+  elseif outcome ~= "invited" and self.session.applicationDetails then
+    self.session.applicationDetails[applicationID] = nil
   end
   saveSession(self.sessionStore, self.session)
   if self.mirrorSessionStore ~= self.sessionStore then saveSession(self.mirrorSessionStore, self.session) end
@@ -196,9 +257,29 @@ function M:resetLifetime()
 end
 
 function M:resetSession()
-  self.session = { applications = 0, active = {}, ended = false }
+  self.session = { applications = 0, active = {}, applicationDetails = {}, ended = false }
   saveSession(self.sessionStore, self.session)
   if self.mirrorSessionStore ~= self.sessionStore then saveSession(self.mirrorSessionStore, self.session) end
+end
+
+function M.parseKeyLevel(text)
+  if type(text) ~= "string" then return nil end
+  local levelText = text:match("^%+%s*(%d+)%f[%D]")
+    or text:match("%s%+%s*(%d+)%f[%D]")
+  local level = tonumber(levelText)
+  if not level or level < 1 or level > 99 then return nil end
+  return level
+end
+
+function M.acceptedDestination(session)
+  session = session or {}
+  local dungeon = session.acceptedDungeon
+  local keyLevel = session.acceptedKeyLevel
+  if dungeon and dungeon ~= "" then
+    if keyLevel then return string.format("%s +%d", dungeon, keyLevel) end
+    return dungeon
+  end
+  return "Mythic+ group"
 end
 
 function M.activeCount(active)
@@ -258,6 +339,10 @@ function M.historyRows(history, limit)
       accepted = session.accepted or 0,
       duration = session.duration or 0,
       reason = session.reason or "ended",
+      destination = session.reason == "accepted" and M.acceptedDestination(session) or nil,
+      acceptedKeyLevel = session.acceptedKeyLevel,
+      appliedRoles = copyRoles(session.appliedRoles),
+      acceptedRole = session.acceptedRole,
       stats = M.sessionStats(session, true),
     })
   end
